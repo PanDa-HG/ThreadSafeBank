@@ -1,0 +1,20 @@
+# Compiled output
+*.exe
+*.out
+*.o
+*.obj
+
+# Build folders
+build/
+cmake-build-debug/
+cmake-build-release/
+
+# VS Code
+.vscode/
+
+# JetBrains IDE
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
