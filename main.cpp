@@ -9,6 +9,8 @@
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
+#include <iomanip>
+#include <memory>
 
 using namespace std;
 
@@ -147,7 +149,6 @@ public:
     }
 
     ReaderWriterLock(const ReaderWriterLock&) = delete;
-
     ReaderWriterLock& operator=(const ReaderWriterLock&) = delete;
 
     void lockRead() {
@@ -195,7 +196,6 @@ public:
         unique_lock<mutex> lock(mtx);
 
         activeWriter = false;
-
         cv.notify_all();
     }
 
@@ -219,7 +219,6 @@ public:
         unique_lock<mutex> lock(mtx);
 
         activeWriter = false;
-
         cv.notify_all();
     }
 };
@@ -239,7 +238,6 @@ public:
     }
 
     ReadLockGuard(const ReadLockGuard&) = delete;
-
     ReadLockGuard& operator=(const ReadLockGuard&) = delete;
 };
 
@@ -258,7 +256,6 @@ public:
     }
 
     WriteLockGuard(const WriteLockGuard&) = delete;
-
     WriteLockGuard& operator=(const WriteLockGuard&) = delete;
 };
 
@@ -277,7 +274,6 @@ public:
     }
 
     CloseLockGuard(const CloseLockGuard&) = delete;
-
     CloseLockGuard& operator=(const CloseLockGuard&) = delete;
 };
 
@@ -304,7 +300,6 @@ public:
     }
 
     TransactionLog(const TransactionLog&) = delete;
-
     TransactionLog& operator=(const TransactionLog&) = delete;
 
     void addTransaction(
@@ -412,7 +407,6 @@ public:
     }
 
     Account(const Account&) = delete;
-
     Account& operator=(const Account&) = delete;
 
     ReaderWriterLock& getLock() {
@@ -457,7 +451,6 @@ public:
         }
 
         balance -= amount;
-
         return true;
     }
 
@@ -476,7 +469,7 @@ public:
 
 class BankService {
 private:
-    unordered_map<int, Account*> accounts;
+    unordered_map<int, unique_ptr<Account>> accounts;
     TransactionLog transactionLog;
     int nextAccountId;
     mutex bankMutex;
@@ -508,7 +501,8 @@ private:
             return nullptr;
         }
 
-        return it->second;
+        // The map still owns the account.
+        return it->second.get();
     }
 
 public:
@@ -516,14 +510,7 @@ public:
         : nextAccountId(1001) {
     }
 
-    ~BankService() {
-        for (auto& entry : accounts) {
-            delete entry.second;
-        }
-    }
-
     BankService(const BankService&) = delete;
-
     BankService& operator=(const BankService&) = delete;
 
     int createAccount(
@@ -553,7 +540,7 @@ public:
             accountId = nextAccountId;
             nextAccountId++;
 
-            accounts[accountId] = new Account(
+            accounts[accountId] = make_unique<Account>(
                 accountId,
                 name,
                 pin,
@@ -822,6 +809,7 @@ public:
         Account* firstAccount;
         Account* secondAccount;
 
+        // Fixed lock order prevents transfer deadlocks.
         if (fromAccountId < toAccountId) {
             firstAccount = fromAccount;
             secondAccount = toAccount;
@@ -930,7 +918,6 @@ public:
 
         if (account == nullptr) {
             cout << "Balance check failed: Invalid account ID.\n";
-
             return false;
         }
 
@@ -938,13 +925,11 @@ public:
 
         if (!account->verifyPin(pin)) {
             cout << "Balance check failed: Invalid PIN.\n";
-
             return false;
         }
 
         if (!account->isActive()) {
             cout << "Balance check failed: Account is closed.\n";
-
             return false;
         }
 
@@ -974,7 +959,6 @@ public:
 
         if (account == nullptr) {
             cout << "PIN change failed: Invalid account ID.\n";
-
             return false;
         }
 
@@ -982,13 +966,11 @@ public:
 
         if (!account->verifyPin(oldPin)) {
             cout << "PIN change failed: Old PIN is incorrect.\n";
-
             return false;
         }
 
         if (!account->isActive()) {
             cout << "PIN change failed: Account is closed.\n";
-
             return false;
         }
 
@@ -1115,7 +1097,6 @@ public:
 
         if (account == nullptr) {
             cout << "History failed: Invalid account ID.\n";
-
             return false;
         }
 
@@ -1124,7 +1105,6 @@ public:
 
             if (!account->verifyPin(pin)) {
                 cout << "History failed: Invalid PIN.\n";
-
                 return false;
             }
         }
@@ -1146,14 +1126,14 @@ public:
             accountId = nextAccountId;
             nextAccountId++;
 
-            account = new Account(
+            accounts[accountId] = make_unique<Account>(
                 accountId,
                 "RaceTestAccount",
                 "000000",
                 0
             );
 
-            accounts[accountId] = account;
+            account = accounts[accountId].get();
         }
 
         const int numberOfThreads = 4;
@@ -1235,14 +1215,14 @@ public:
             accountId = nextAccountId;
             nextAccountId++;
 
-            account = new Account(
+            accounts[accountId] = make_unique<Account>(
                 accountId,
                 "SafeTestAccount",
                 "000000",
                 0
             );
 
-            accounts[accountId] = account;
+            account = accounts[accountId].get();
         }
 
         const int numberOfThreads = 4;
@@ -1313,6 +1293,216 @@ public:
             cout << "Balance mismatch even after synchronization.\n";
         }
     }
+
+    void runTransferTest() {
+        cout << "Running concurrent transfer test...\n\n";
+
+        const int numberOfAccounts = 8;
+        const int numberOfThreads = 8;
+        const int transfersPerThread = 50000;
+
+        const long long initialBalance = 100000;
+        const long long transferAmount = 1;
+
+        vector<Account*> testAccounts;
+
+        {
+            unique_lock<mutex> lock(bankMutex);
+
+            for (int i = 0; i < numberOfAccounts; i++) {
+                int accountId = nextAccountId;
+                nextAccountId++;
+
+                accounts[accountId] = make_unique<Account>(
+                    accountId,
+                    "TransferTest" + to_string(i + 1),
+                    "000000",
+                    initialBalance
+                );
+
+                testAccounts.push_back(
+                    accounts[accountId].get()
+                );
+            }
+        }
+
+        long long totalBalanceBefore = 0;
+
+        for (Account* account : testAccounts) {
+            ReadLockGuard guard(account->getLock());
+            totalBalanceBefore += account->getBalance();
+        }
+
+        vector<long long> successfulTransfers(
+            numberOfThreads,
+            0
+        );
+
+        vector<long long> failedTransfers(
+            numberOfThreads,
+            0
+        );
+
+        const long long attemptedTransfers =
+            1LL * numberOfThreads * transfersPerThread;
+
+        cout << "Accounts: "
+             << numberOfAccounts << "\n";
+
+        cout << "Initial Balance per Account: "
+             << initialBalance << "\n";
+
+        cout << "Threads: "
+             << numberOfThreads << "\n";
+
+        cout << "Transfers per Thread: "
+             << transfersPerThread << "\n";
+
+        cout << "Attempted Transfers: "
+             << attemptedTransfers << "\n\n";
+
+        auto startTime =
+            chrono::high_resolution_clock::now();
+
+        vector<thread> workers;
+
+        for (
+            int threadId = 0;
+            threadId < numberOfThreads;
+            threadId++
+        ) {
+            workers.emplace_back(
+                [&, threadId]() {
+                    for (
+                        int operation = 0;
+                        operation < transfersPerThread;
+                        operation++
+                    ) {
+                        int fromIndex =
+                            (threadId + operation) %
+                            numberOfAccounts;
+
+                        int toIndex =
+                            (fromIndex + 1) %
+                            numberOfAccounts;
+
+                        Account* fromAccount =
+                            testAccounts[fromIndex];
+
+                        Account* toAccount =
+                            testAccounts[toIndex];
+
+                        Account* firstAccount;
+                        Account* secondAccount;
+
+                        if (
+                            fromAccount->getAccountId() <
+                            toAccount->getAccountId()
+                        ) {
+                            firstAccount = fromAccount;
+                            secondAccount = toAccount;
+                        } else {
+                            firstAccount = toAccount;
+                            secondAccount = fromAccount;
+                        }
+
+                        WriteLockGuard firstGuard(
+                            firstAccount->getLock()
+                        );
+
+                        WriteLockGuard secondGuard(
+                            secondAccount->getLock()
+                        );
+
+                        if (
+                            fromAccount->withdraw(
+                                transferAmount
+                            )
+                        ) {
+                            toAccount->deposit(
+                                transferAmount
+                            );
+
+                            successfulTransfers[threadId]++;
+                        } else {
+                            failedTransfers[threadId]++;
+                        }
+                    }
+                }
+            );
+        }
+
+        for (thread& worker : workers) {
+            worker.join();
+        }
+
+        auto endTime =
+            chrono::high_resolution_clock::now();
+
+        double durationSeconds =
+            chrono::duration<double>(
+                endTime - startTime
+            ).count();
+
+        long long totalSuccessfulTransfers = 0;
+        long long totalFailedTransfers = 0;
+
+        for (int i = 0; i < numberOfThreads; i++) {
+            totalSuccessfulTransfers +=
+                successfulTransfers[i];
+
+            totalFailedTransfers +=
+                failedTransfers[i];
+        }
+
+        long long totalBalanceAfter = 0;
+
+        for (Account* account : testAccounts) {
+            ReadLockGuard guard(account->getLock());
+            totalBalanceAfter += account->getBalance();
+        }
+
+        double throughput = 0.0;
+
+        if (durationSeconds > 0.0) {
+            throughput =
+                attemptedTransfers / durationSeconds;
+        }
+
+        cout << "Successful Transfers: "
+             << totalSuccessfulTransfers << "\n";
+
+        cout << "Failed Transfers: "
+             << totalFailedTransfers << "\n\n";
+
+        cout << "Total Balance Before: "
+             << totalBalanceBefore << "\n";
+
+        cout << "Total Balance After: "
+             << totalBalanceAfter << "\n\n";
+
+        cout << fixed << setprecision(3);
+
+        cout << "Time Taken: "
+             << durationSeconds << " seconds\n";
+
+        cout << setprecision(0);
+
+        cout << "Throughput: "
+             << throughput
+             << " transfers/second\n\n";
+
+        if (totalBalanceBefore == totalBalanceAfter) {
+            cout << "Concurrent transfer test passed.\n";
+            cout << "No money was lost or created.\n";
+            cout << "All worker threads completed successfully.\n";
+        } else {
+            cout << "Concurrent transfer test failed.\n";
+            cout << "The total balance changed during transfers.\n";
+        }
+
+        cout << defaultfloat;
+    }
 };
 
 string toUpperCase(string text) {
@@ -1351,6 +1541,7 @@ void printHelp() {
     cout << "CLOSE_ACCOUNT <accountId> <pin>\n";
     cout << "RUN_RACE_TEST\n";
     cout << "RUN_SAFE_TEST\n";
+    cout << "RUN_TRANSFER_TEST\n";
     cout << "HELP\n";
     cout << "QUIT or EXIT\n\n";
 
@@ -1365,7 +1556,8 @@ void printHelp() {
     cout << "CHANGE_PIN 1001 123456 111111\n";
     cout << "CLOSE_ACCOUNT 1001 111111\n";
     cout << "RUN_RACE_TEST\n";
-    cout << "RUN_SAFE_TEST\n\n";
+    cout << "RUN_SAFE_TEST\n";
+    cout << "RUN_TRANSFER_TEST\n\n";
 }
 
 int main() {
@@ -1391,7 +1583,6 @@ int main() {
         stringstream ss(line);
 
         string command;
-
         ss >> command;
 
         command = toUpperCase(command);
@@ -1581,6 +1772,16 @@ int main() {
 
             bank.runSafeTest();
         }
+        else if (command == "RUN_TRANSFER_TEST") {
+            if (hasExtraInput(ss)) {
+                cout << "Invalid command format.\n";
+                cout << "Usage: RUN_TRANSFER_TEST\n";
+
+                continue;
+            }
+
+            bank.runTransferTest();
+        }
         else if (command == "HELP") {
             if (hasExtraInput(ss)) {
                 cout << "Invalid command format.\n";
@@ -1603,7 +1804,6 @@ int main() {
             }
 
             cout << "Exiting ThreadSafeBank. Goodbye!\n";
-
             break;
         }
         else {
