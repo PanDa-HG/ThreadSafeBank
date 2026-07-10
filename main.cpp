@@ -5,13 +5,22 @@
 #include <cctype>
 #include <vector>
 #include <ctime>
+#include <thread>
+#include <chrono>
+#include <mutex>
 
 using namespace std;
+
+enum class AccountStatus {
+    ACTIVE,
+    CLOSED
+};
 
 enum class TransactionType {
     DEPOSIT,
     WITHDRAW,
-    TRANSFER
+    TRANSFER,
+    CLOSE_ACCOUNT
 };
 
 enum class TransactionStatus {
@@ -25,13 +34,23 @@ enum class FailureReason {
     INVALID_PIN,
     INSUFFICIENT_BALANCE,
     INVALID_AMOUNT,
-    SAME_ACCOUNT
+    SAME_ACCOUNT,
+    ACCOUNT_CLOSED,
+    NON_ZERO_BALANCE
 };
+
+string accountStatusToString(AccountStatus status) {
+    if (status == AccountStatus::ACTIVE) return "ACTIVE";
+    if (status == AccountStatus::CLOSED) return "CLOSED";
+
+    return "UNKNOWN";
+}
 
 string transactionTypeToString(TransactionType type) {
     if (type == TransactionType::DEPOSIT) return "DEPOSIT";
     if (type == TransactionType::WITHDRAW) return "WITHDRAW";
     if (type == TransactionType::TRANSFER) return "TRANSFER";
+    if (type == TransactionType::CLOSE_ACCOUNT) return "CLOSE_ACCOUNT";
 
     return "UNKNOWN";
 }
@@ -50,6 +69,8 @@ string failureReasonToString(FailureReason reason) {
     if (reason == FailureReason::INSUFFICIENT_BALANCE) return "INSUFFICIENT_BALANCE";
     if (reason == FailureReason::INVALID_AMOUNT) return "INVALID_AMOUNT";
     if (reason == FailureReason::SAME_ACCOUNT) return "SAME_ACCOUNT";
+    if (reason == FailureReason::ACCOUNT_CLOSED) return "ACCOUNT_CLOSED";
+    if (reason == FailureReason::NON_ZERO_BALANCE) return "NON_ZERO_BALANCE";
 
     return "UNKNOWN";
 }
@@ -149,6 +170,7 @@ private:
     string name;
     string pin;
     long long balance;
+    AccountStatus status;
 
 public:
     Account(int id, const string& accountName, const string& accountPin, long long initialBalance) {
@@ -156,6 +178,7 @@ public:
         name = accountName;
         pin = accountPin;
         balance = initialBalance;
+        status = AccountStatus::ACTIVE;
     }
 
     int getAccountId() const {
@@ -168,6 +191,14 @@ public:
 
     long long getBalance() const {
         return balance;
+    }
+
+    AccountStatus getStatus() const {
+        return status;
+    }
+
+    bool isActive() const {
+        return status == AccountStatus::ACTIVE;
     }
 
     bool verifyPin(const string& inputPin) const {
@@ -189,6 +220,21 @@ public:
 
         balance -= amount;
         return true;
+    }
+
+    void close() {
+        status = AccountStatus::CLOSED;
+    }
+
+    // Intentionally unsafe function used only for concurrency demos.
+    void unsafeDepositForRaceTest(long long amount) {
+        long long oldBalance = balance;
+
+        // This increases the chance of thread switching.
+        this_thread::yield();
+
+        long long newBalance = oldBalance + amount;
+        balance = newBalance;
     }
 };
 
@@ -242,6 +288,7 @@ public:
         cout << "Account ID: " << accountId << "\n";
         cout << "Name: " << name << "\n";
         cout << "Initial Balance: " << initialBalance << "\n";
+        cout << "Status: ACTIVE\n";
 
         return accountId;
     }
@@ -280,6 +327,22 @@ public:
         }
 
         Account& account = it->second;
+
+        if (!account.isActive()) {
+            cout << "Deposit failed: Account is closed.\n";
+
+            transactionLog.addTransaction(
+                TransactionType::DEPOSIT,
+                accountId,
+                -1,
+                amount,
+                TransactionStatus::FAILED,
+                FailureReason::ACCOUNT_CLOSED
+            );
+
+            return false;
+        }
+
         account.deposit(amount);
 
         transactionLog.addTransaction(
@@ -349,6 +412,21 @@ public:
             return false;
         }
 
+        if (!account.isActive()) {
+            cout << "Withdraw failed: Account is closed.\n";
+
+            transactionLog.addTransaction(
+                TransactionType::WITHDRAW,
+                accountId,
+                -1,
+                amount,
+                TransactionStatus::FAILED,
+                FailureReason::ACCOUNT_CLOSED
+            );
+
+            return false;
+        }
+
         bool success = account.withdraw(amount);
 
         if (!success) {
@@ -399,6 +477,21 @@ public:
             return false;
         }
 
+        if (fromAccountId == toAccountId) {
+            cout << "Transfer failed: Source and destination account cannot be same.\n";
+
+            transactionLog.addTransaction(
+                TransactionType::TRANSFER,
+                fromAccountId,
+                toAccountId,
+                amount,
+                TransactionStatus::FAILED,
+                FailureReason::SAME_ACCOUNT
+            );
+
+            return false;
+        }
+
         auto fromIt = accounts.find(fromAccountId);
 
         if (fromIt == accounts.end()) {
@@ -433,21 +526,6 @@ public:
             return false;
         }
 
-        if (fromAccountId == toAccountId) {
-            cout << "Transfer failed: Source and destination account cannot be same.\n";
-
-            transactionLog.addTransaction(
-                TransactionType::TRANSFER,
-                fromAccountId,
-                toAccountId,
-                amount,
-                TransactionStatus::FAILED,
-                FailureReason::SAME_ACCOUNT
-            );
-
-            return false;
-        }
-
         Account& fromAccount = fromIt->second;
         Account& toAccount = toIt->second;
 
@@ -461,6 +539,36 @@ public:
                 amount,
                 TransactionStatus::FAILED,
                 FailureReason::INVALID_PIN
+            );
+
+            return false;
+        }
+
+        if (!fromAccount.isActive()) {
+            cout << "Transfer failed: Source account is closed.\n";
+
+            transactionLog.addTransaction(
+                TransactionType::TRANSFER,
+                fromAccountId,
+                toAccountId,
+                amount,
+                TransactionStatus::FAILED,
+                FailureReason::ACCOUNT_CLOSED
+            );
+
+            return false;
+        }
+
+        if (!toAccount.isActive()) {
+            cout << "Transfer failed: Destination account is closed.\n";
+
+            transactionLog.addTransaction(
+                TransactionType::TRANSFER,
+                fromAccountId,
+                toAccountId,
+                amount,
+                TransactionStatus::FAILED,
+                FailureReason::ACCOUNT_CLOSED
             );
 
             return false;
@@ -519,10 +627,16 @@ public:
             return false;
         }
 
+        if (!account.isActive()) {
+            cout << "Balance check failed: Account is closed.\n";
+            return false;
+        }
+
         cout << "Balance details:\n";
         cout << "Account ID: " << account.getAccountId() << "\n";
         cout << "Name: " << account.getName() << "\n";
         cout << "Balance: " << account.getBalance() << "\n";
+        cout << "Status: " << accountStatusToString(account.getStatus()) << "\n";
 
         return true;
     }
@@ -542,6 +656,11 @@ public:
             return false;
         }
 
+        if (!account.isActive()) {
+            cout << "PIN change failed: Account is closed.\n";
+            return false;
+        }
+
         if (!isValidPin(newPin)) {
             cout << "PIN change failed: New PIN must be exactly 6 digits.\n";
             return false;
@@ -556,6 +675,90 @@ public:
 
         cout << "PIN changed successfully.\n";
         cout << "Account ID: " << accountId << "\n";
+
+        return true;
+    }
+
+    bool closeAccount(int accountId, const string& pin) {
+        auto it = accounts.find(accountId);
+
+        if (it == accounts.end()) {
+            cout << "Close account failed: Invalid account ID.\n";
+
+            transactionLog.addTransaction(
+                TransactionType::CLOSE_ACCOUNT,
+                accountId,
+                -1,
+                0,
+                TransactionStatus::FAILED,
+                FailureReason::INVALID_ACCOUNT
+            );
+
+            return false;
+        }
+
+        Account& account = it->second;
+
+        if (!account.verifyPin(pin)) {
+            cout << "Close account failed: Invalid PIN.\n";
+
+            transactionLog.addTransaction(
+                TransactionType::CLOSE_ACCOUNT,
+                accountId,
+                -1,
+                0,
+                TransactionStatus::FAILED,
+                FailureReason::INVALID_PIN
+            );
+
+            return false;
+        }
+
+        if (!account.isActive()) {
+            cout << "Close account failed: Account is already closed.\n";
+
+            transactionLog.addTransaction(
+                TransactionType::CLOSE_ACCOUNT,
+                accountId,
+                -1,
+                0,
+                TransactionStatus::FAILED,
+                FailureReason::ACCOUNT_CLOSED
+            );
+
+            return false;
+        }
+
+        if (account.getBalance() != 0) {
+            cout << "Close account failed: Account balance must be zero before closing.\n";
+            cout << "Current Balance: " << account.getBalance() << "\n";
+
+            transactionLog.addTransaction(
+                TransactionType::CLOSE_ACCOUNT,
+                accountId,
+                -1,
+                0,
+                TransactionStatus::FAILED,
+                FailureReason::NON_ZERO_BALANCE
+            );
+
+            return false;
+        }
+
+        account.close();
+
+        transactionLog.addTransaction(
+            TransactionType::CLOSE_ACCOUNT,
+            accountId,
+            -1,
+            0,
+            TransactionStatus::SUCCESS,
+            FailureReason::NONE
+        );
+
+        cout << "Account closed successfully.\n";
+        cout << "Account ID: " << accountId << "\n";
+        cout << "Status: CLOSED\n";
 
         return true;
     }
@@ -578,6 +781,118 @@ public:
         transactionLog.printHistory(accountId);
 
         return true;
+    }
+
+    void runRaceTest() {
+        cout << "Running race condition demo...\n\n";
+
+        int accountId = nextAccountId;
+        nextAccountId++;
+
+        Account raceAccount(accountId, "RaceTestAccount", "000000", 0);
+        accounts.emplace(accountId, raceAccount);
+
+        Account& account = accounts.find(accountId)->second;
+
+        const int numberOfThreads = 4;
+        const int depositsPerThread = 100000;
+        const long long depositAmount = 1;
+
+        long long expectedBalance = 1LL * numberOfThreads * depositsPerThread * depositAmount;
+
+        cout << "Test Account ID: " << accountId << "\n";
+        cout << "Threads: " << numberOfThreads << "\n";
+        cout << "Deposits per thread: " << depositsPerThread << "\n";
+        cout << "Deposit amount: " << depositAmount << "\n\n";
+
+        auto startTime = chrono::high_resolution_clock::now();
+
+        vector<thread> workers;
+
+        for (int i = 0; i < numberOfThreads; i++) {
+            workers.emplace_back([&account, depositsPerThread, depositAmount]() {
+                for (int j = 0; j < depositsPerThread; j++) {
+                    account.unsafeDepositForRaceTest(depositAmount);
+                }
+            });
+        }
+
+        for (thread& worker : workers) {
+            worker.join();
+        }
+
+        auto endTime = chrono::high_resolution_clock::now();
+        auto durationMs = chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count();
+
+        long long actualBalance = account.getBalance();
+
+        cout << "Expected Balance: " << expectedBalance << "\n";
+        cout << "Actual Balance: " << actualBalance << "\n";
+        cout << "Time Taken: " << durationMs << " ms\n\n";
+
+        if (actualBalance != expectedBalance) {
+            cout << "Race condition detected! Some updates were lost.\n";
+        } else {
+            cout << "Actual balance matched expected balance this time.\n";
+            cout << "Race conditions are timing-dependent, so run the test again.\n";
+        }
+    }
+
+    void runSafeTest() {
+        cout << "Running safe mutex test...\n\n";
+
+        int accountId = nextAccountId;
+        nextAccountId++;
+
+        Account safeAccount(accountId, "SafeTestAccount", "000000", 0);
+        accounts.emplace(accountId, safeAccount);
+
+        Account& account = accounts.find(accountId)->second;
+
+        const int numberOfThreads = 4;
+        const int depositsPerThread = 100000;
+        const long long depositAmount = 1;
+
+        long long expectedBalance = 1LL * numberOfThreads * depositsPerThread * depositAmount;
+
+        mutex testMutex;
+
+        cout << "Test Account ID: " << accountId << "\n";
+        cout << "Threads: " << numberOfThreads << "\n";
+        cout << "Deposits per thread: " << depositsPerThread << "\n";
+        cout << "Deposit amount: " << depositAmount << "\n\n";
+
+        auto startTime = chrono::high_resolution_clock::now();
+
+        vector<thread> workers;
+
+        for (int i = 0; i < numberOfThreads; i++) {
+            workers.emplace_back([&account, &testMutex, depositsPerThread, depositAmount]() {
+                for (int j = 0; j < depositsPerThread; j++) {
+                    unique_lock<mutex> lock(testMutex);
+                    account.unsafeDepositForRaceTest(depositAmount);
+                }
+            });
+        }
+
+        for (thread& worker : workers) {
+            worker.join();
+        }
+
+        auto endTime = chrono::high_resolution_clock::now();
+        auto durationMs = chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count();
+
+        long long actualBalance = account.getBalance();
+
+        cout << "Expected Balance: " << expectedBalance << "\n";
+        cout << "Actual Balance: " << actualBalance << "\n";
+        cout << "Time Taken: " << durationMs << " ms\n\n";
+
+        if (actualBalance == expectedBalance) {
+            cout << "Mutex synchronization successful. No updates were lost.\n";
+        } else {
+            cout << "Something went wrong. Balance mismatch even after mutex.\n";
+        }
     }
 };
 
@@ -608,6 +923,9 @@ void printHelp() {
     cout << "BALANCE <accountId> <pin>\n";
     cout << "HISTORY <accountId> <pin>\n";
     cout << "CHANGE_PIN <accountId> <oldPin> <newPin>\n";
+    cout << "CLOSE_ACCOUNT <accountId> <pin>\n";
+    cout << "RUN_RACE_TEST\n";
+    cout << "RUN_SAFE_TEST\n";
     cout << "HELP\n";
     cout << "QUIT or EXIT\n\n";
 
@@ -620,7 +938,9 @@ void printHelp() {
     cout << "BALANCE 1001 123456\n";
     cout << "HISTORY 1001 123456\n";
     cout << "CHANGE_PIN 1001 123456 111111\n";
-    cout << "BALANCE 1001 111111\n\n";
+    cout << "CLOSE_ACCOUNT 1001 111111\n";
+    cout << "RUN_RACE_TEST\n";
+    cout << "RUN_SAFE_TEST\n\n";
 }
 
 int main() {
@@ -733,6 +1053,36 @@ int main() {
             }
 
             bank.changePin(accountId, oldPin, newPin);
+        }
+        else if (command == "CLOSE_ACCOUNT") {
+            int accountId;
+            string pin;
+
+            if (!(ss >> accountId >> pin) || hasExtraInput(ss)) {
+                cout << "Invalid command format.\n";
+                cout << "Usage: CLOSE_ACCOUNT <accountId> <pin>\n";
+                continue;
+            }
+
+            bank.closeAccount(accountId, pin);
+        }
+        else if (command == "RUN_RACE_TEST") {
+            if (hasExtraInput(ss)) {
+                cout << "Invalid command format.\n";
+                cout << "Usage: RUN_RACE_TEST\n";
+                continue;
+            }
+
+            bank.runRaceTest();
+        }
+        else if (command == "RUN_SAFE_TEST") {
+            if (hasExtraInput(ss)) {
+                cout << "Invalid command format.\n";
+                cout << "Usage: RUN_SAFE_TEST\n";
+                continue;
+            }
+
+            bank.runSafeTest();
         }
         else if (command == "HELP") {
             if (hasExtraInput(ss)) {
